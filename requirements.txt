@@ -1,0 +1,12 @@
+python-telegram-bot==22.0
+ollama==0.4.7
+python-dotenv==1.1.0
+
+# Voice transcription (optional - lightweight, recommended)
+# faster-whisper
+
+# Web search (optional)
+duckduckgo_search==6.2.13
+
+# PDF/text document support (optional)
+PyMuPDF==1.25.3
