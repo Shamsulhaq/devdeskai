@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from html import escape
@@ -10,6 +11,8 @@ from telegram.constants import ParseMode
 from bot import config, persistence
 
 logger = logging.getLogger(__name__)
+
+MAX_PREDICT_TOKENS = 1024  # BUG-021 fix
 
 _client = None
 
@@ -54,17 +57,10 @@ def build_messages(
     return messages
 
 
-async def generate(
-    user_id: int,
-    prompt: str,
-    image_data: str | None = None,
+def _sync_generate(
+    model: str, messages: list[dict], opts: dict | None
 ) -> str:
-    model = get_model(user_id)
-    messages = build_messages(user_id, prompt, image_data)
-    opts = {}
-    temp = get_temperature(user_id)
-    if temp is not None:
-        opts["temperature"] = temp
+    """Synchronous Ollama call — must be run in a thread (BUG-006 fix)."""
     client = get_client()
     stream = client.chat(
         model=model,
@@ -76,7 +72,35 @@ async def generate(
     for chunk in stream:
         content = chunk.get("message", {}).get("content", "") or ""
         full += content
-    return full or "No response generated."
+    return full
+
+
+async def generate(
+    user_id: int,
+    prompt: str,
+    image_data: str | None = None,
+) -> str:
+    model = get_model(user_id)
+    messages = build_messages(user_id, prompt, image_data)
+    opts = {"num_predict": MAX_PREDICT_TOKENS}  # BUG-021 fix
+    temp = get_temperature(user_id)
+    if temp is not None:
+        opts["temperature"] = temp
+
+    # BUG-006 fix: run sync Ollama call in thread so event loop stays free
+    for attempt in range(2):  # BUG-020 fix: single retry on connection error
+        try:
+            full = await asyncio.to_thread(_sync_generate, model, messages, opts)
+            return full or "No response generated."
+        except (ConnectionError, TimeoutError) as e:
+            if attempt == 1:
+                logger.error("Ollama connection failed: %s", e)
+                return "Ollama is unreachable. Please try again."
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.exception("Ollama generate failed")
+            return f"Error: {e}"
+    return "No response generated."  # unreachable
 
 
 async def reply_long(
@@ -84,7 +108,11 @@ async def reply_long(
     text: str,
 ) -> None:
     MAX_LEN = 4096
-    reply = target.message.reply_text if hasattr(target, "message") else target
+    # BUG-022 fix: explicit type check
+    if callable(target) and not hasattr(target, "message"):
+        reply = target
+    else:
+        reply = target.message.reply_text
     if len(text) <= MAX_LEN:
         await reply(text, parse_mode=ParseMode.HTML)
         return
@@ -116,13 +144,19 @@ async def generate_and_reply(
         {"user": user_text, "assistant": reply}
     )
     persistence.track_user(user_id)
-    persistence.save(config.DATA_FILE)
+    # BUG-015 fix: use async save with lock
+    await persistence.save_async(config.DATA_FILE)
     await reply_long(update, escape(reply))
     return reply
 
 
+# BUG-019 fix: default is always a non-empty string
+DEFAULT_PERSONA_PROMPT = (
+    "You are DevDeskAI, an AI assistant. "
+    "Respond conversationally and concisely."
+)
 PERSONAS = {
-    "default": config.SYSTEM_PROMPT,
+    "default": config.SYSTEM_PROMPT or DEFAULT_PERSONA_PROMPT,
     "coder": (
         "You are an expert software engineer. Write clean, efficient, "
         "well-documented code. Think step by step and explain your reasoning."

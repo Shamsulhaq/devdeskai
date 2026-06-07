@@ -1,7 +1,7 @@
 import logging
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from bot import config, persistence
 from bot import agents as agent_system
@@ -13,6 +13,7 @@ from bot.handlers import (
     media,
     custom,
 )
+from bot.handlers.media import load_whisper_async
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -21,15 +22,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def error_handler(update: object, context: object) -> None:
-    logger.error("Update %s caused error %s", update, context.error if hasattr(context, 'error') else context)
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # BUG-024 fix: proper type hint
+    logger.error("Update %s caused error %s", update, context.error)
+
+
+async def _post_init(application: Application) -> None:
+    """BUG-004 fix: eager-load heavy resources on startup, not on first use."""
+    await load_whisper_async()
 
 
 def main() -> None:
     persistence.load(config.DATA_FILE)
     agent_system.detect()
 
-    app = Application.builder().token(config.BOT_TOKEN).build()
+    app = Application.builder().token(config.BOT_TOKEN).post_init(_post_init).build()
 
     # Core commands
     app.add_handler(CommandHandler("start", core.start))

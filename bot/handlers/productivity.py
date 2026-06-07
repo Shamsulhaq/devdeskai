@@ -60,7 +60,7 @@ async def web_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         persistence.chat_histories[uid].append(
             {"user": f"[web search] {query}", "assistant": reply}
         )
-        persistence.save(config.DATA_FILE)
+        await persistence.save_async(config.DATA_FILE)
         await reply_long(update, escape(reply))
     except Exception as e:
         await update.message.reply_text(f"Search error: {e}")
@@ -97,7 +97,7 @@ async def ask_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         persistence.chat_histories[uid].append(
             {"user": f"[doc] {question}", "assistant": reply}
         )
-        persistence.save(config.DATA_FILE)
+        await persistence.save_async(config.DATA_FILE)
         await reply_long(update, escape(reply))
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")

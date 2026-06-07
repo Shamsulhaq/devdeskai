@@ -1,4 +1,3 @@
-import os
 from html import escape
 
 from telegram import Update
@@ -7,6 +6,7 @@ from telegram.ext import ContextTypes
 
 from bot import config, persistence
 from bot import agents as agent_system
+from bot.handlers.media import _safe_workspace
 from bot.ollama import reply_long
 
 
@@ -21,7 +21,12 @@ async def list_agents(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def enter_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    agent_name = update.message.text.split()[0].lstrip("/").lower()
+    # BUG-016 fix: defensive against empty text
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    parts = text.split(maxsplit=1)
+    agent_name = parts[0].lstrip("/").lower()
     info = agent_system.get_available().get(agent_name)
     if not info:
         return
@@ -32,7 +37,7 @@ async def enter_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     persistence.user_agent[uid] = agent_name
-    persistence.save(config.DATA_FILE)
+    await persistence.save_async(config.DATA_FILE)
 
     prompt = " ".join(context.args) if context.args else ""
     if prompt:
@@ -42,13 +47,16 @@ async def enter_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, action=ChatAction.TYPING
         )
-        workspace = os.path.join(config.WORKSPACE_DIR, str(uid))
-        os.makedirs(workspace, exist_ok=True)
+        try:
+            workspace = _safe_workspace(uid)
+        except ValueError as e:
+            await update.message.reply_text(f"Workspace error: {e}")
+            return
         out = await agent_system.run_cli(agent_name, prompt, workspace)
         persistence.user_agent_history[uid].append(
             {"prompt": prompt, "output": out}
         )
-        persistence.save(config.DATA_FILE)
+        await persistence.save_async(config.DATA_FILE)
         await reply_long(update, escape(out))
     else:
         await update.message.reply_text(
@@ -60,7 +68,7 @@ async def enter_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def exit_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     agent_name = persistence.user_agent.pop(uid, None)
-    persistence.save(config.DATA_FILE)
+    await persistence.save_async(config.DATA_FILE)
     if agent_name:
         info = agent_system.get_available().get(agent_name, {})
         await update.message.reply_text(

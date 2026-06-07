@@ -6,9 +6,9 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 MODEL = os.getenv("MODEL", "gemma4:e4b")
-SYSTEM_PROMPT = os.getenv(
-    "SYSTEM_PROMPT",
-    "You are DevDeskAI, an AI assistant. Respond conversationally and concisely.",
+# BUG-019 fix: always non-empty
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT") or (
+    "You are DevDeskAI, an AI assistant. Respond conversationally and concisely."
 )
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 
@@ -18,11 +18,27 @@ if admin_raw:
     ADMIN_IDS = {int(x.strip()) for x in admin_raw.split(",") if x.strip()}
 
 DATA_FILE = os.getenv("DATA_FILE", "bot_data.json")
-WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", os.path.join(os.getcwd(), "workspace"))
+
+# BUG-017 fix: resolve and validate WORKSPACE_DIR
+WORKSPACE_DIR = os.path.abspath(
+    os.getenv("WORKSPACE_DIR", os.path.join(os.getcwd(), "workspace"))
+)
+os.makedirs(WORKSPACE_DIR, exist_ok=True)
+
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8443"))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+# BUG-025 + BUG-026 fix: validate webhook config
+if WEBHOOK_URL:
+    if not WEBHOOK_URL.startswith("https://"):
+        raise ValueError("WEBHOOK_URL must be HTTPS for Telegram webhooks")
+    if WEBHOOK_PORT not in (443, 80, 88, 8443):
+        raise ValueError(
+            f"Invalid WEBHOOK_PORT {WEBHOOK_PORT}. "
+            "Allowed: 443, 80, 88, 8443"
+        )
 
 CUSTOM_COMMANDS: dict[str, str] = {}
 for key, val in os.environ.items():

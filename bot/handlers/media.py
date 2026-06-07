@@ -1,7 +1,9 @@
-import io
-import os
+import asyncio
 import base64
+import io
 import logging
+import os
+import tempfile
 import time
 from html import escape
 from pathlib import Path
@@ -14,6 +16,14 @@ from bot import config, persistence
 from bot.ollama import generate, generate_and_reply, reply_long
 
 logger = logging.getLogger(__name__)
+
+# BUG-009 fix: size limits
+MAX_DOC_BYTES = 20 * 1024 * 1024  # 20MB
+MAX_DOC_CHARS_STORED = 50_000
+
+# BUG-011 fix: photo size index
+# Telegram sends 3+ sizes; index 1 is ~160px, 2 is ~320px, 3 is ~800px, -1 is original
+PREFERRED_PHOTO_INDEX = 2  # ~800px is enough for vision models
 
 WHISPER_AVAILABLE = False
 _whisper_model = None
@@ -30,7 +40,29 @@ except ImportError:
         pass
 
 
-def _get_whisper():
+async def load_whisper_async() -> None:
+    """Eager-load Whisper model in a thread (BUG-004 fix).
+
+    Call at startup so the first voice message doesn't block the event loop.
+    """
+    global _whisper_model, _whisper_is_faster
+    if _whisper_model is not None or not WHISPER_AVAILABLE:
+        return
+    try:
+        from faster_whisper import WhisperModel
+        _whisper_model = await asyncio.to_thread(
+            WhisperModel, "base", device="auto"
+        )
+        _whisper_is_faster = True
+    except ImportError:
+        import whisper
+        _whisper_model = await asyncio.to_thread(whisper.load_model, "base")
+        _whisper_is_faster = False
+    logger.info("Whisper model loaded (faster=%s)", _whisper_is_faster)
+
+
+def _get_whisper_sync():
+    """Lazy fallback if not preloaded."""
     global _whisper_model, _whisper_is_faster
     if _whisper_model is not None:
         return _whisper_model, _whisper_is_faster
@@ -47,6 +79,16 @@ def _get_whisper():
     return _whisper_model, _whisper_is_faster
 
 
+async def _get_whisper():
+    """Async-safe getter: loads in thread if not yet loaded."""
+    if _whisper_model is not None:
+        return _whisper_model, _whisper_is_faster
+    if not WHISPER_AVAILABLE:
+        return None, False
+    await load_whisper_async()
+    return _whisper_model, _whisper_is_faster
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
 
@@ -60,13 +102,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, action=ChatAction.TYPING
         )
-        workspace = os.path.join(config.WORKSPACE_DIR, str(uid))
-        os.makedirs(workspace, exist_ok=True)
+        workspace = _safe_workspace(uid)
         out = await agent_system.run_cli(agent_name, text, workspace)
         persistence.user_agent_history[uid].append(
             {"prompt": text, "output": out}
         )
-        persistence.save(config.DATA_FILE)
+        await persistence.save_async(config.DATA_FILE)
         await reply_long(update, escape(out))
         return
 
@@ -75,7 +116,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     image_data = None
 
     if update.message.photo:
-        photo = update.message.photo[-1]
+        # BUG-011 fix: use a smaller photo size, not the full-resolution one
+        photos = update.message.photo
+        photo = photos[min(PREFERRED_PHOTO_INDEX, len(photos) - 1)]
         file = await photo.get_file()
         img_bytes = await file.download_as_bytearray()
         image_data = base64.b64encode(img_bytes).decode("utf-8")
@@ -97,7 +140,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    wh, is_faster = _get_whisper()
+    wh, is_faster = await _get_whisper()
     if wh is None:
         await update.message.reply_text(
             "Voice transcription not available. Install:\n"
@@ -109,22 +152,29 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
+    # BUG-008 + BUG-010 fix: use NamedTemporaryFile, clean up in finally
+    ogg_path = None
     try:
         file = await update.message.voice.get_file()
         ogg_bytes = io.BytesIO()
         await file.download_to_memory(ogg_bytes)
-        ogg_path = f"/tmp/voice_{uid}_{int(time.time())}.ogg"
-        with open(ogg_path, "wb") as f:
-            f.write(ogg_bytes.getvalue())
+        with tempfile.NamedTemporaryFile(
+            suffix=".ogg", delete=False
+        ) as tf:
+            tf.write(ogg_bytes.getvalue())
+            ogg_path = tf.name
 
-        if is_faster:
-            segments, _ = wh.transcribe(ogg_path)
-            text = " ".join(seg.text for seg in segments)
-        else:
-            result = wh.transcribe(ogg_path)
-            text = result.get("text", "").strip()
+        def _transcribe():
+            if is_faster:
+                segments, _ = wh.transcribe(ogg_path)
+                return " ".join(seg.text for seg in segments)
+            else:
+                result = wh.transcribe(ogg_path)
+                return result.get("text", "").strip()
 
-        os.remove(ogg_path)
+        # Run sync Whisper in a thread so it doesn't block the loop
+        text = await asyncio.to_thread(_transcribe)
+
         if not text:
             await update.message.reply_text("Could not transcribe voice.")
             return
@@ -135,11 +185,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             {"user": f"[voice] {text}", "assistant": reply}
         )
         persistence.track_user(uid)
-        persistence.save(config.DATA_FILE)
+        await persistence.save_async(config.DATA_FILE)
         await reply_long(update, escape(reply))
     except Exception as e:
         logger.error("Voice error: %s", e)
         await update.message.reply_text(f"Voice processing error: {e}")
+    finally:
+        if ogg_path:
+            try:
+                Path(ogg_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -153,6 +209,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if ext not in (".txt", ".pdf", ".md", ".csv", ".json"):
         await update.message.reply_text(
             "Supported formats: .txt, .pdf, .md, .csv, .json"
+        )
+        return
+
+    # BUG-009 fix: cap raw upload size
+    if doc.file_size and doc.file_size > MAX_DOC_BYTES:
+        await update.message.reply_text(
+            f"File too large ({doc.file_size // 1024 // 1024}MB). "
+            f"Max is {MAX_DOC_BYTES // 1024 // 1024}MB."
         )
         return
 
@@ -174,10 +238,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     "PDF support requires PyMuPDF: `pip install PyMuPDF`"
                 )
                 return
-            pdf_doc = fitz.open(stream=raw.read(), filetype="pdf")
-            for page in pdf_doc:
-                text += page.get_text() + "\n"
-            pdf_doc.close()
+            # BUG-003 fix: context manager guarantees close()
+            with fitz.open(stream=raw.read(), filetype="pdf") as pdf_doc:
+                for page in pdf_doc:
+                    text += page.get_text() + "\n"
         else:
             text = raw.read().decode("utf-8", errors="replace")
 
@@ -187,12 +251,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
+        # BUG-009 fix: cap stored text size
+        truncated = False
+        if len(text) > MAX_DOC_CHARS_STORED:
+            text = text[:MAX_DOC_CHARS_STORED]
+            truncated = True
+
         persistence.user_docs[uid] = text
-        persistence.save(config.DATA_FILE)
-        await update.message.reply_text(
-            f"Document saved ({len(text)} chars). "
-            "Use /ask &lt;question&gt; to query it."
-        )
+        await persistence.save_async(config.DATA_FILE)
+        msg = f"Document saved ({len(text)} chars"
+        if truncated:
+            msg += f", truncated from original"
+        msg += "). Use /ask <question> to query it."
+        await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"Document error: {e}")
 
@@ -216,3 +287,14 @@ async def handle_group_mention(
     except Exception as e:
         logger.error("Group error: %s", e)
         await update.message.reply_text("Error.")
+
+
+def _safe_workspace(user_id: int) -> str:
+    """BUG-017 fix: ensure workspace stays inside WORKSPACE_DIR."""
+    base = Path(config.WORKSPACE_DIR).resolve()
+    user_dir = (base / str(user_id)).resolve()
+    # Path traversal guard
+    if not str(user_dir).startswith(str(base) + os.sep) and user_dir != base:
+        raise ValueError(f"Unsafe workspace path: {user_dir}")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    return str(user_dir)

@@ -55,7 +55,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id in persistence.chat_histories:
         del persistence.chat_histories[user_id]
-        persistence.save(config.DATA_FILE)
+        await persistence.save_async(config.DATA_FILE)
     await update.message.reply_text("History cleared.")
 
 
@@ -100,7 +100,7 @@ async def switch_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
         persistence.user_models[user_id] = name
-        persistence.save(config.DATA_FILE)
+        await persistence.save_async(config.DATA_FILE)
         await update.message.reply_text(f"Switched to **{name}**")
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
@@ -125,7 +125,7 @@ async def set_temperature(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
         persistence.user_temps[user_id] = val
-        persistence.save(config.DATA_FILE)
+        await persistence.save_async(config.DATA_FILE)
         await update.message.reply_text(f"Temperature set to **{val}**")
     except ValueError:
         await update.message.reply_text("Usage: /temp &lt;0-2&gt;")
@@ -142,7 +142,7 @@ async def set_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     prompt = " ".join(context.args)
     persistence.user_prompts[user_id] = prompt
-    persistence.save(config.DATA_FILE)
+    await persistence.save_async(config.DATA_FILE)
     await update.message.reply_text("System prompt updated!")
 
 
@@ -150,7 +150,7 @@ async def reset_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
     for d in (persistence.user_prompts, persistence.user_personas):
         d.pop(user_id, None)
-    persistence.save(config.DATA_FILE)
+    await persistence.save_async(config.DATA_FILE)
     await update.message.reply_text("Prompt reset to default.")
 
 
@@ -170,5 +170,5 @@ async def set_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     persistence.user_personas[user_id] = name
     persistence.user_prompts.pop(user_id, None)
-    persistence.save(config.DATA_FILE)
+    await persistence.save_async(config.DATA_FILE)
     await update.message.reply_text(f"Switched to **{name}** persona.")
