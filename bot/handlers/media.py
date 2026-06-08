@@ -13,15 +13,13 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 from bot import config, persistence
-from bot.ollama import generate, generate_and_reply, reply_long
+from bot.ollama import OllamaError, generate, generate_and_reply, reply_long
 
 logger = logging.getLogger(__name__)
 
-# BUG-009 fix: size limits
 MAX_DOC_BYTES = 20 * 1024 * 1024  # 20MB
 MAX_DOC_CHARS_STORED = 50_000
 
-# BUG-011 fix: photo size index
 # Telegram sends 3+ sizes; index 1 is ~160px, 2 is ~320px, 3 is ~800px, -1 is original
 PREFERRED_PHOTO_INDEX = 2  # ~800px is enough for vision models
 
@@ -116,12 +114,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     image_data = None
 
     if update.message.photo:
-        # BUG-011 fix: use a smaller photo size, not the full-resolution one
+        # use a smaller photo size, not the full-resolution one
         photos = update.message.photo
         photo = photos[min(PREFERRED_PHOTO_INDEX, len(photos) - 1)]
         file = await photo.get_file()
         img_bytes = await file.download_as_bytearray()
-        image_data = base64.b64encode(img_bytes).decode("utf-8")
+        # base64-encode multi-MB photo off the loop thread
+        encoded = await asyncio.to_thread(base64.b64encode, bytes(img_bytes))
+        image_data = encoded.decode("utf-8")
         if not user_text:
             user_text = "Describe this image"
 
@@ -134,7 +134,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         await generate_and_reply(update, uid, user_text, image_data)
     except Exception as e:
-        logger.error("Chat error: %s", e)
+        # log full exception, send generic reply
+        logger.exception("chat handler failed")
         await update.message.reply_text("Error. Is Ollama running?")
 
 
@@ -152,17 +153,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
-    # BUG-008 + BUG-010 fix: use NamedTemporaryFile, clean up in finally
+    # use NamedTemporaryFile, clean up in finally
     ogg_path = None
     try:
         file = await update.message.voice.get_file()
-        ogg_bytes = io.BytesIO()
-        await file.download_to_memory(ogg_bytes)
+        # download straight to disk, skip in-memory copy
         with tempfile.NamedTemporaryFile(
             suffix=".ogg", delete=False
         ) as tf:
-            tf.write(ogg_bytes.getvalue())
             ogg_path = tf.name
+        await file.download_to_drive(custom_path=ogg_path)
 
         def _transcribe():
             if is_faster:
@@ -180,7 +180,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         await update.message.reply_text(f"Transcribed: _{text}_")
-        reply = await generate(uid, text)
+        try:
+            reply = await generate(uid, text)
+        except OllamaError:
+            # do not persist on backend failure.
+            await update.message.reply_text("AI is unreachable, please try again.")
+            return
         persistence.chat_histories[uid].append(
             {"user": f"[voice] {text}", "assistant": reply}
         )
@@ -188,8 +193,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await persistence.save_async(config.DATA_FILE)
         await reply_long(update, escape(reply))
     except Exception as e:
-        logger.error("Voice error: %s", e)
-        await update.message.reply_text(f"Voice processing error: {e}")
+        # log full exception, send generic reply
+        logger.exception("voice handler failed")
+        await update.message.reply_text(
+            "Could not process the voice message. Please try again."
+        )
     finally:
         if ogg_path:
             try:
@@ -212,7 +220,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # BUG-009 fix: cap raw upload size
     if doc.file_size and doc.file_size > MAX_DOC_BYTES:
         await update.message.reply_text(
             f"File too large ({doc.file_size // 1024 // 1024}MB). "
@@ -238,12 +245,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     "PDF support requires PyMuPDF: `pip install PyMuPDF`"
                 )
                 return
-            # BUG-003 fix: context manager guarantees close()
+            # context manager guarantees close()
             with fitz.open(stream=raw.read(), filetype="pdf") as pdf_doc:
                 for page in pdf_doc:
                     text += page.get_text() + "\n"
         else:
-            text = raw.read().decode("utf-8", errors="replace")
+            # try common encodings in order; latin-1 always succeeds
+            raw_bytes = raw.read()
+            for enc in ("utf-8", "utf-8-sig", "cp1252"):
+                try:
+                    text = raw_bytes.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                text = raw_bytes.decode("latin-1")
 
         if not text.strip():
             await update.message.reply_text(
@@ -251,7 +267,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
-        # BUG-009 fix: cap stored text size
         truncated = False
         if len(text) > MAX_DOC_CHARS_STORED:
             text = text[:MAX_DOC_CHARS_STORED]
@@ -265,7 +280,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         msg += "). Use /ask <question> to query it."
         await update.message.reply_text(msg)
     except Exception as e:
-        await update.message.reply_text(f"Document error: {e}")
+        # log full exception, send generic reply
+        logger.exception("doc handler failed")
+        await update.message.reply_text(
+            "Could not process the document. Please try again."
+        )
 
 
 async def handle_group_mention(
@@ -285,7 +304,8 @@ async def handle_group_mention(
     try:
         await generate_and_reply(update, uid, cleaned)
     except Exception as e:
-        logger.error("Group error: %s", e)
+        # log full exception, send generic reply
+        logger.exception("group mention handler failed")
         await update.message.reply_text("Error.")
 
 
@@ -293,8 +313,7 @@ def _safe_workspace(user_id: int) -> str:
     """BUG-017 fix: ensure workspace stays inside WORKSPACE_DIR."""
     base = Path(config.WORKSPACE_DIR).resolve()
     user_dir = (base / str(user_id)).resolve()
-    # Path traversal guard
-    if not str(user_dir).startswith(str(base) + os.sep) and user_dir != base:
+    if not user_dir.is_relative_to(base):
         raise ValueError(f"Unsafe workspace path: {user_dir}")
     user_dir.mkdir(parents=True, exist_ok=True)
     return str(user_dir)

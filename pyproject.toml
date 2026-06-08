@@ -1,0 +1,14 @@
+# Tooling configuration for DevDeskAI.
+#
+# Note: mypy is intentionally NOT configured here. Type hints across `bot/`
+# are inconsistent (untyped handlers, partial generic signatures, optional
+# deps without `Optional[...]`). Enabling mypy now would produce hundreds of
+# low-signal warnings. Revisit once Group G's cleanup pass lands.
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -23,8 +23,15 @@ logger = logging.getLogger(__name__)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # BUG-024 fix: proper type hint
-    logger.error("Update %s caused error %s", update, context.error)
+    # log only update_id (full Update contains PII).
+    update_id = update.update_id if isinstance(update, Update) else "non-update"
+    if context.error is not None:
+        logger.exception(
+            "Update %s caused error %s", update_id, context.error,
+            exc_info=context.error,
+        )
+    else:
+        logger.error("Update %s caused error (no exception attached)", update_id)
 
 
 async def _post_init(application: Application) -> None:
@@ -34,6 +41,12 @@ async def _post_init(application: Application) -> None:
 
 def main() -> None:
     persistence.load(config.DATA_FILE)
+    # warn loudly when no admins are configured.
+    if not config.ADMIN_IDS:
+        logger.warning(
+            "ADMIN_IDS is empty; /announce will refuse requests. "
+            "Set ADMIN_IDS to enable admin commands."
+        )
     agent_system.detect()
 
     app = Application.builder().token(config.BOT_TOKEN).post_init(_post_init).build()

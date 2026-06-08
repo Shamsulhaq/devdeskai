@@ -6,7 +6,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 MODEL = os.getenv("MODEL", "gemma4:e4b")
-# BUG-019 fix: always non-empty
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT") or (
     "You are DevDeskAI, an AI assistant. Respond conversationally and concisely."
 )
@@ -19,7 +18,7 @@ if admin_raw:
 
 DATA_FILE = os.getenv("DATA_FILE", "bot_data.json")
 
-# BUG-017 fix: resolve and validate WORKSPACE_DIR
+# resolve and validate WORKSPACE_DIR
 WORKSPACE_DIR = os.path.abspath(
     os.getenv("WORKSPACE_DIR", os.path.join(os.getcwd(), "workspace"))
 )
@@ -30,7 +29,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8443"))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
-# BUG-025 + BUG-026 fix: validate webhook config
+# validate webhook config
 if WEBHOOK_URL:
     if not WEBHOOK_URL.startswith("https://"):
         raise ValueError("WEBHOOK_URL must be HTTPS for Telegram webhooks")
@@ -40,12 +39,22 @@ if WEBHOOK_URL:
             "Allowed: 443, 80, 88, 8443"
         )
 
+# CUSTOM_CMD_<NAME> defines a custom command /<name>. Its value is the prompt
+# template, UNLESS CUSTOM_CMD_<NAME>_PROMPT is also set, in which case the
+# _PROMPT variant takes precedence. To avoid silent overrides, setting both
+# with different values is a startup error.
 CUSTOM_COMMANDS: dict[str, str] = {}
 for key, val in os.environ.items():
     if key.startswith("CUSTOM_CMD_") and not key.endswith("_PROMPT"):
         name = key[len("CUSTOM_CMD_"):].lower()
         prompt_key = f"CUSTOM_CMD_{name.upper()}_PROMPT"
-        prompt = os.getenv(prompt_key, val)
+        prompt_override = os.getenv(prompt_key)
+        if prompt_override is not None and prompt_override != val:
+            raise ValueError(
+                f"{key} and {prompt_key} are both set with different values; "
+                f"unset one or make them match."
+            )
+        prompt = prompt_override if prompt_override is not None else val
         CUSTOM_COMMANDS[name] = prompt
 
 if not BOT_TOKEN:

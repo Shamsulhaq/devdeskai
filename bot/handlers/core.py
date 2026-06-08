@@ -1,3 +1,5 @@
+import asyncio
+import time
 from html import escape
 
 from telegram import Update
@@ -7,6 +9,23 @@ from bot import config, persistence
 from bot.agents import get_available
 from bot.ollama import PERSONAS, reply_long
 
+# and repeated round-trips on /models.
+_model_list_cache: tuple[float, list[str]] | None = None
+_MODEL_LIST_TTL = 10.0
+
+
+async def _get_model_names() -> list[str]:
+    global _model_list_cache
+    now = time.monotonic()
+    if _model_list_cache and now - _model_list_cache[0] < _MODEL_LIST_TTL:
+        return _model_list_cache[1]
+    from bot.ollama import get_client
+    # ollama client .list() is sync; offload to a thread.
+    data = await asyncio.to_thread(lambda: get_client().list())
+    names = [m["name"] for m in data.get("models", [])]
+    _model_list_cache = (now, names)
+    return names
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -14,7 +33,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if in_agent:
         info = get_available().get(in_agent, {})
         await update.message.reply_text(
-            f"You are in **{info.get('label', in_agent)}** mode.\n"
+            f"You are in {info.get('label', in_agent)} mode.\n"
             "Type /exit to return."
         )
         return
@@ -28,10 +47,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     custom_list = ", ".join(f"`{n}`" for n in config.CUSTOM_COMMANDS)
 
     text = (
-        f"Hello! I'm **DevDeskAI**, powered by "
+        f"Hello! I'm DevDeskAI, powered by "
         f"{persistence.user_models.get(user_id, config.MODEL)} on Ollama.\n\n"
-        f"**AI Agents:**\n{agent_list}\n\n"
-        f"**Commands:**\n"
+        f"AI Agents:\n{agent_list}\n\n"
+        f"Commands:\n"
         f"/reset - Clear history\n"
         f"/model - Show model\n"
         f"/models - List models\n"
@@ -46,7 +65,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"/stats - Usage stats\n"
     )
     if custom_list:
-        text += f"\n**Custom commands:** {custom_list}\n"
+        text += f"\nCustom commands: {custom_list}\n"
     text += "\nSend me a message, photo, voice, or document!"
     await update.message.reply_text(text)
 
@@ -55,7 +74,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id in persistence.chat_histories:
         del persistence.chat_histories[user_id]
-        await persistence.save_async(config.DATA_FILE)
+        persistence.save(config.DATA_FILE)
     await update.message.reply_text("History cleared.")
 
 
@@ -64,18 +83,16 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     model = persistence.user_models.get(user_id, config.MODEL)
     temp = persistence.user_temps.get(user_id)
     extra = f", temperature: {temp}" if temp is not None else ""
-    await update.message.reply_text(f"Model: **{model}**{extra}")
+    await update.message.reply_text(f"Model: {model}{extra}")
 
 
 async def list_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from bot.ollama import get_client
     try:
-        data = get_client().list()
-        names = [m["name"] for m in data.get("models", [])]
+        names = await _get_model_names()
         if not names:
             await update.message.reply_text("No models found.")
             return
-        text = "**Available models:**\n" + "\n".join(f"- {m}" for m in names)
+        text = "Available models:\n" + "\n".join(f"- {m}" for m in names)
         await update.message.reply_text(text)
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
@@ -90,18 +107,17 @@ async def switch_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
     name = context.args[0]
-    from bot.ollama import get_client
     try:
-        data = get_client().list()
-        available = {m["name"] for m in data.get("models", [])}
+        names = await _get_model_names()
+        available = set(names)
         if name not in available:
             await update.message.reply_text(
                 f"Model '{name}' not found. Use /models."
             )
             return
         persistence.user_models[user_id] = name
-        await persistence.save_async(config.DATA_FILE)
-        await update.message.reply_text(f"Switched to **{name}**")
+        persistence.save(config.DATA_FILE)
+        await update.message.reply_text(f"Switched to {name}")
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -111,7 +127,7 @@ async def set_temperature(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not context.args:
         cur = persistence.user_temps.get(user_id)
         if cur is not None:
-            await update.message.reply_text(f"Temperature: **{cur}**")
+            await update.message.reply_text(f"Temperature: {cur}")
         else:
             await update.message.reply_text(
                 "Temperature not set (model default)."
@@ -125,8 +141,8 @@ async def set_temperature(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
         persistence.user_temps[user_id] = val
-        await persistence.save_async(config.DATA_FILE)
-        await update.message.reply_text(f"Temperature set to **{val}**")
+        persistence.save(config.DATA_FILE)
+        await update.message.reply_text(f"Temperature set to {val}")
     except ValueError:
         await update.message.reply_text("Usage: /temp &lt;0-2&gt;")
 
@@ -142,7 +158,7 @@ async def set_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     prompt = " ".join(context.args)
     persistence.user_prompts[user_id] = prompt
-    await persistence.save_async(config.DATA_FILE)
+    persistence.save(config.DATA_FILE)
     await update.message.reply_text("System prompt updated!")
 
 
@@ -150,7 +166,7 @@ async def reset_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
     for d in (persistence.user_prompts, persistence.user_personas):
         d.pop(user_id, None)
-    await persistence.save_async(config.DATA_FILE)
+    persistence.save(config.DATA_FILE)
     await update.message.reply_text("Prompt reset to default.")
 
 
@@ -159,7 +175,7 @@ async def set_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not context.args:
         cur = persistence.user_personas.get(user_id)
         items = ", ".join(f"`{p}`" for p in PERSONAS)
-        msg = f"Personas: {items}\nCurrent: **{cur}**" if cur else f"Personas: {items}\nCurrent: default"
+        msg = f"Personas: {items}\nCurrent: {cur}" if cur else f"Personas: {items}\nCurrent: default"
         await update.message.reply_text(msg)
         return
     name = context.args[0].lower()
@@ -170,5 +186,5 @@ async def set_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     persistence.user_personas[user_id] = name
     persistence.user_prompts.pop(user_id, None)
-    await persistence.save_async(config.DATA_FILE)
-    await update.message.reply_text(f"Switched to **{name}** persona.")
+    persistence.save(config.DATA_FILE)
+    await update.message.reply_text(f"Switched to {name} persona.")
