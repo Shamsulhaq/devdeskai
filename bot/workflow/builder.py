@@ -150,44 +150,106 @@ class ProjectBuild:
         await persistence.save_async(config.DATA_FILE)
 
     async def _generate_code(self) -> None:
-        """Phase 2: pick a code agent, dispatch, collect output."""
+        """Phase 2: pick a code agent, dispatch, collect output.
+
+        If the agent returns error text or writes no useful files, retry
+        with a different agent. After all agents fail, attempt to generate
+        code via Ollama directly.
+        """
         await self._emit(
             f"💻 **Coding** using {self.tech_stack.get('language', 'auto-detected')}",
             [{"id": "code", "label": "Code agent builds project", "status": "running"}],
         )
         self.wf.current_stage = StageType.CODING
 
-        agent = await self._pick_code_agent()
-        prompt = brain_module.format_code_prompt(
-            _read_file(self.project_dir, "PRD.md") or self.request
-        )
+        prd_text = _read_file(self.project_dir, "PRD.md") or self.request
+        prompt = brain_module.format_code_prompt(prd_text)
         if self.tech_stack:
             prompt = f"Tech stack to use: {self.tech_stack}\n\n{prompt}"
 
-        result = await self._dispatch_with_fallback(agent, prompt)
-        if isinstance(result, Exception):
-            self.wf.action_history.append({
-                "action": "code",
-                "result": f"All agents failed: {result}",
-            })
-            self.wf.status = "cancelled"
-            await persistence.save_async(config.DATA_FILE)
-            raise RuntimeError(f"Code generation failed: {result}")
+        # Try all available agents in order
+        available = orchestrator._get_available_agents()
+        installed = [n for n, v in available.items() if v.get("available")]
+        result_text: str = ""
+        files: dict = {}
+        last_error: str = ""
 
-        self.code_output = result
-        files = brain_module.parse_file_markers(result)
+        for agent in installed:
+            await self._emit(
+                f"💻 **Coding** with `{agent}`",
+                [{"id": "code", "label": f"Trying {agent}",
+                  "status": "running"}],
+            )
+            try:
+                result = await orchestrator.run_brain_step(
+                    agent, prompt, self.project_dir, self.user_id
+                )
+            except Exception as e:
+                last_error = f"{agent} raised: {e}"
+                continue
+            if isinstance(result, Exception):
+                last_error = f"{agent} failed: {result}"
+                continue
+            result_text = result
+            files = brain_module.parse_file_markers(result)
+            if _is_useful_code_output(files, result):
+                break
+            last_error = f"{agent} returned no useful code (got {len(files)} files)"
+            files = {}
+            result_text = ""
+
+        # If all agents failed, fall back to Ollama (which can also generate code)
+        if not files:
+            await self._emit(
+                "💻 **Coding** with Ollama fallback",
+                [{"id": "code", "label": "Ollama fallback",
+                  "status": "running"}],
+            )
+            fallback_prompt = (
+                f"You are generating production code. "
+                f"Output ALL files using this exact format on its own line:\n"
+                f"--- filename.ext ---\n<full file content>\n\n"
+                f"Project: {prd_text}\n"
+                f"Tech stack: {self.tech_stack}\n\n"
+                f"Generate the complete project. No prose, only file markers."
+            )
+            try:
+                fallback = await orchestrator.run_brain_step(
+                    "opencode", fallback_prompt, self.project_dir, self.user_id
+                )
+            except Exception:
+                fallback = None
+            if isinstance(fallback, Exception) or not fallback:
+                # Last resort: call Ollama directly
+                from bot import ollama as ollama_module
+                fallback = await ollama_module.generate(self.user_id, fallback_prompt)
+            result_text = fallback or ""
+            files = brain_module.parse_file_markers(result_text)
+            if not _is_useful_code_output(files, result_text):
+                raise RuntimeError(
+                    f"Code generation failed across all agents and Ollama. "
+                    f"Last error: {last_error}"
+                )
+
+        self.code_output = result_text
         for name, content in files.items():
             _write_file(self.project_dir, name, content)
 
         self.wf.action_history.append({
             "action": "code",
-            "result": f"{agent} wrote {len(files)} files",
+            "result": f"wrote {len(files)} files: {', '.join(list(files.keys())[:8])}",
         })
         self.wf.updated_at = time.time()
         await persistence.save_async(config.DATA_FILE)
 
     async def _run_tests(self) -> None:
-        """Phase 3: run tests — brain if confident, else delegate to test agent."""
+        """Phase 3: run tests — brain if confident, else delegate to test agent.
+
+        Honest semantics:
+        - passed=True + skipped=True  → no test command AND no test files
+        - passed=True                 → tests actually ran and passed
+        - passed=False                → tests ran and failed (or setup error)
+        """
         self.wf.current_stage = StageType.VERIFY
         await self._emit(
             "🧪 **Running tests...**",
@@ -195,13 +257,53 @@ class ProjectBuild:
         )
 
         detected = tech.detect_tech_stack(self.project_dir)
-        if detected and not self.tech_stack.get("test_cmd"):
-            self.tech_stack["test_cmd"] = detected.get("test_cmd", "")
+        if detected:
+            # Merge detected metadata into our tech stack, but keep explicit values
+            for k, v in detected.items():
+                if k in ("files", "test_pattern", "framework_hint", "agent_hint"):
+                    continue
+                if not self.tech_stack.get(k):
+                    self.tech_stack[k] = v
             self.wf.tech_stack = self.tech_stack
+
+        # If no test command is known, try to infer one
         if not self.tech_stack.get("test_cmd"):
-            self.test_results = {"passed": True, "skipped": True,
-                                 "summary": "No test command detected"}
+            if detected and detected.get("test_cmd"):
+                self.tech_stack["test_cmd"] = detected["test_cmd"]
+            elif self.tech_stack.get("language") in ("javascript", "typescript"):
+                # Common JS/TS convention
+                if os.path.exists(os.path.join(self.project_dir, "package.json")):
+                    self.tech_stack["test_cmd"] = "npm test --silent"
+                else:
+                    self.tech_stack["test_cmd"] = "npm test"
+            self.wf.tech_stack = self.tech_stack
+
+        # Static HTML sites have no real test command — mark skipped (not a pass)
+        if self.tech_stack.get("stack") == "static":
+            self.test_results = {
+                "passed": True,
+                "skipped": True,
+                "summary": "Static HTML project — no tests to run",
+            }
             self.wf.last_test_results = self.test_results
+            self.wf.action_history.append({
+                "action": "test",
+                "result": "skipped (static site)",
+            })
+            await persistence.save_async(config.DATA_FILE)
+            return
+
+        if not self.tech_stack.get("test_cmd"):
+            self.test_results = {
+                "passed": False,
+                "skipped": True,
+                "summary": "No test command detected — tests NOT run",
+            }
+            self.wf.last_test_results = self.test_results
+            self.wf.action_history.append({
+                "action": "test",
+                "result": "skipped (no test_cmd)",
+            })
             await persistence.save_async(config.DATA_FILE)
             return
 
@@ -430,3 +532,38 @@ def _read_file(workspace: str, name: str) -> str:
         return ""
     with open(path) as f:
         return f.read()
+
+
+def _is_useful_code_output(files: dict, raw: str) -> bool:
+    """Heuristic: is the agent output actually code, or just an error/garbage?
+
+    Returns True if at least one file has substantial code content.
+    """
+    if not files:
+        return False
+    # Look for at least one file with meaningful content
+    total_chars = 0
+    for name, content in files.items():
+        if name == "raw_output.txt":
+            continue
+        total_chars += len(content)
+    # Need at least 200 chars of non-raw-output content
+    if total_chars < 200:
+        return False
+    # If all files are tiny or have error content, reject
+    for content in files.values():
+        if _looks_like_error(content):
+            return False
+    return True
+
+
+_ERROR_PREFIXES = (
+    "/bin/sh:", "/bin/bash:", "command not found", "syntax error",
+    "Traceback", "error:", "Error:", "ERROR:",
+    "Agent error:", "Agent timed out", "Usage:",
+)
+
+
+def _looks_like_error(text: str) -> bool:
+    head = text[:300].lower()
+    return sum(1 for m in _ERROR_PREFIXES if m.lower() in head) >= 2

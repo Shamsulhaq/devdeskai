@@ -1,7 +1,8 @@
 """Tests for `bot.agents.run_cli`.
 
-`run_cli` shells out to external CLIs (claude, opencode, …). These tests
-mock `asyncio.create_subprocess_shell` so no real process is ever spawned.
+`run_cli` uses subprocess_exec with an argv list (no shell) to invoke
+external CLIs (claude, opencode, codex, …). These tests mock
+`asyncio.create_subprocess_exec` so no real process is ever spawned.
 """
 from __future__ import annotations
 
@@ -65,19 +66,20 @@ async def test_run_cli_success_returns_stdout() -> None:
     fake = _FakeProc(stdout=b"hello from claude\n")
 
     with patch(
-        "bot.agents.asyncio.create_subprocess_shell",
+        "bot.agents.asyncio.create_subprocess_exec",
         new=AsyncMock(return_value=fake),
     ) as mock_spawn:
         result = await agents.run_cli("claude", "review main.py", workspace="/tmp")
 
     assert result == "hello from claude"
     mock_spawn.assert_awaited_once()
-    # The command string passed to the shell should contain the agent run cmd
-    # and the prompt.
+    # The argv passed to subprocess_exec should contain the agent run cmd
+    # and the prompt as separate elements (no shell).
     args, kwargs = mock_spawn.call_args
-    cmd_str = args[0]
-    assert cmd_str.startswith("claude -p")
-    assert "review main.py" in cmd_str
+    argv = list(args)
+    assert argv[0] == "claude"
+    assert argv[1] == "-p"
+    assert "review main.py" in argv
     assert kwargs.get("cwd") == "/tmp"
 
 
@@ -89,7 +91,7 @@ async def test_run_cli_appends_stderr_only_on_failure() -> None:
     success = _FakeProc(stdout=b"stdout text", stderr=b"warn: thing")
     success.returncode = 0
     with patch(
-        "bot.agents.asyncio.create_subprocess_shell",
+        "bot.agents.asyncio.create_subprocess_exec",
         new=AsyncMock(return_value=success),
     ):
         result = await agents.run_cli("opencode", "x", workspace=".")
@@ -100,7 +102,7 @@ async def test_run_cli_appends_stderr_only_on_failure() -> None:
     failure = _FakeProc(stdout=b"stdout text", stderr=b"real error")
     failure.returncode = 1
     with patch(
-        "bot.agents.asyncio.create_subprocess_shell",
+        "bot.agents.asyncio.create_subprocess_exec",
         new=AsyncMock(return_value=failure),
     ):
         result = await agents.run_cli("opencode", "x", workspace=".")
@@ -118,7 +120,7 @@ async def test_run_cli_timeout_returns_timeout_message() -> None:
     fake = _FakeProc(stdout=b"")
 
     with patch(
-        "bot.agents.asyncio.create_subprocess_shell",
+        "bot.agents.asyncio.create_subprocess_exec",
         new=AsyncMock(return_value=fake),
     ), patch("bot.agents.asyncio.wait_for", new=AsyncMock(side_effect=_raise_timeout)):
         result = await agents.run_cli("claude", "long task", workspace=".")
@@ -130,13 +132,37 @@ async def test_run_cli_unexpected_exception_is_caught() -> None:
     _register("claude", available=True, run_cmd="claude -p")
 
     with patch(
-        "bot.agents.asyncio.create_subprocess_shell",
+        "bot.agents.asyncio.create_subprocess_exec",
         new=AsyncMock(side_effect=RuntimeError("boom")),
     ):
         result = await agents.run_cli("claude", "x", workspace=".")
 
     assert "Agent error" in result
     assert "boom" in result
+
+
+async def test_run_cli_no_shell_injection() -> None:
+    """Prompt with backticks / newlines / shell metachars must not break
+    the agent invocation. subprocess_exec passes argv as a list, so
+    no shell parsing occurs.
+    """
+    _register("claude", available=True, run_cmd="claude -p")
+    fake = _FakeProc(stdout=b"ok\n")
+    dangerous = (
+        "Review this code:\n```html\n<!DOCTYPE html><html>...</html>\n```\n"
+        "Includes `backticks` and $variables and ; semicolons."
+    )
+    with patch(
+        "bot.agents.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=fake),
+    ) as mock_spawn:
+        result = await agents.run_cli("claude", dangerous, workspace="/tmp")
+
+    assert result == "ok"
+    args, _ = mock_spawn.call_args
+    argv = list(args)
+    # The prompt must be passed as a single argv element, not interpreted
+    assert argv[-1] == dangerous
 
 
 def test_detect_populates_registry(monkeypatch: pytest.MonkeyPatch) -> None:

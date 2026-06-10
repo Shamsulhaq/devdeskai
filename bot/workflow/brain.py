@@ -546,13 +546,19 @@ def parse_file_markers(text: str) -> dict[str, str]:
     """Parse agent output into {filename: content} dict.
 
     Tries multiple strategies in order:
+      0. Detect shell/agent error output and reject (return empty)
       1. --- filename.ext --- markers
       2. ```language / ``` code blocks
       3. JSON {"filename": "content"} format
       4. Content-type detection (HTML/JS/CSS)
       5. Fallback: save entire output as raw_output.txt
     """
-    files = {}
+    files: dict[str, str] = {}
+
+    # Pattern 0: reject shell/agent error output
+    text_stripped = text.strip()
+    if _looks_like_error_output(text_stripped):
+        return files
 
     # Pattern 1: --- filename.ext ---
     marker_pat = re.compile(r"^---\s+(.+?)\s+---\s*$", re.MULTILINE)
@@ -560,10 +566,13 @@ def parse_file_markers(text: str) -> dict[str, str]:
     if len(markers) >= 1:
         for i, m in enumerate(markers):
             name = m.group(1).strip()
+            # Sanitize filename — reject names with shell meta or path traversal
+            if not _is_safe_filename(name):
+                continue
             start = m.end()
             end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
             content = text[start:end].strip()
-            if content:
+            if content and not _looks_like_error_output(content):
                 files[name] = content
         if files:
             return files
@@ -577,9 +586,10 @@ def parse_file_markers(text: str) -> dict[str, str]:
             start = bts[i].end()
             end = bts[i + 1].start()
             content = text[start:end].strip()
-            if content:
+            if content and not _looks_like_error_output(content):
                 name = _lang_to_filename(lang, i // 2)
-                files[name] = content
+                if _is_safe_filename(name):
+                    files[name] = content
         if files:
             return files
 
@@ -590,7 +600,7 @@ def parse_file_markers(text: str) -> dict[str, str]:
             parsed = json.loads(json_match.group())
             if isinstance(parsed, dict):
                 for k, v in parsed.items():
-                    if isinstance(v, str) and v.strip():
+                    if isinstance(v, str) and v.strip() and _is_safe_filename(str(k)):
                         files[str(k)] = v
                 if files:
                     return files
@@ -598,7 +608,6 @@ def parse_file_markers(text: str) -> dict[str, str]:
             pass
 
     # Pattern 4: detect by content type
-    text_stripped = text.strip()
     if re.search(r"<!DOCTYPE html|<\s*html[^>]*>", text_stripped, re.IGNORECASE):
         files["index.html"] = text_stripped
         return files
@@ -621,6 +630,43 @@ def parse_file_markers(text: str) -> dict[str, str]:
     # Pattern 5: fallback — entire output as one file
     files["raw_output.txt"] = text_stripped
     return files
+
+
+_ERROR_MARKERS = (
+    "/bin/sh:",
+    "/bin/bash:",
+    "command not found",
+    "syntax error",
+    "command substitution",
+    "Usage:",
+    "[stderr]",
+    "error: unexpected argument",
+    "Traceback (most recent call last):",
+    "Agent error:",
+    "Agent timed out",
+)
+
+
+def _looks_like_error_output(text: str) -> bool:
+    """Return True if the text appears to be shell/agent error output, not code."""
+    if not text:
+        return True
+    lower = text.lower()
+    # If multiple error markers appear in the first ~500 chars, it's an error
+    head = lower[:500]
+    matches = sum(1 for m in _ERROR_MARKERS if m.lower() in head)
+    return matches >= 2
+
+
+def _is_safe_filename(name: str) -> bool:
+    """Reject names with shell metacharacters or path traversal."""
+    if not name or len(name) > 200:
+        return False
+    if ".." in name or name.startswith("/") or "\\" in name:
+        return False
+    if any(c in name for c in "<>|\"'`$;&\n\r\t"):
+        return False
+    return True
 
 
 def _lang_to_filename(lang: str, index: int) -> str:
