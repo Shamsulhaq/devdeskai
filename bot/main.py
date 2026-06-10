@@ -13,6 +13,7 @@ from bot.handlers import (
     media,
     custom,
 )
+from bot.workflow import handlers as workflow_handlers
 from bot.handlers.media import load_whisper_async
 
 logging.basicConfig(
@@ -77,6 +78,12 @@ def main() -> None:
     app.add_handler(CommandHandler("back", agents.exit_agent))
     for name in agent_system.AGENTS_CONFIG:
         app.add_handler(CommandHandler(name, agents.enter_agent))
+
+    # Workflow commands
+    app.add_handler(CommandHandler("build", workflow_handlers.start_build))
+    app.add_handler(CommandHandler("wf_status", workflow_handlers.show_status))
+    app.add_handler(CommandHandler("wf_cancel", workflow_handlers.cancel_workflow))
+    app.add_handler(CommandHandler("wf_usage", workflow_handlers.show_usage))
 
     # Custom commands from env
     for name in config.CUSTOM_COMMANDS:

@@ -1,4 +1,5 @@
 import os
+import time
 from html import escape
 
 from telegram import Update
@@ -7,6 +8,7 @@ from telegram.ext import ContextTypes
 
 from bot import config, persistence
 from bot import agents as agent_system
+from bot.workflow.models import Workflow
 from bot.ollama import reply_long
 
 
@@ -47,8 +49,14 @@ async def enter_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, action=ChatAction.TYPING
         )
-        workspace = os.path.join(config.WORKSPACE_DIR, str(uid))
+        # Isolated per-session folder — agents never see the user root
+        workspace = os.path.join(
+            config.WORKSPACE_DIR, str(uid), "interactive",
+            f"{agent_name}_{int(time.time())}"
+        )
         os.makedirs(workspace, exist_ok=True)
+        # Ensure brain dir exists for consistency
+        Workflow.brain_dir(uid)
         out = await agent_system.run_cli(agent_name, prompt, workspace)
         persistence.user_agent_history[uid].append(
             {"prompt": prompt, "output": out}

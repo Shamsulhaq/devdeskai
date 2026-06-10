@@ -63,9 +63,11 @@ def build_messages(
     user_id: int,
     user_message: str,
     image_data: str | None = None,
+    system: str | None = None,
 ) -> list[dict]:
     history = persistence.chat_histories[user_id]
-    messages = [{"role": "system", "content": get_system_prompt(user_id)}]
+    system_prompt = system if system is not None else get_system_prompt(user_id)
+    messages = [{"role": "system", "content": system_prompt}]
     for entry in history[-config.MAX_HISTORY :]:
         messages.append({"role": "user", "content": entry["user"]})
         messages.append({"role": "assistant", "content": entry["assistant"]})
@@ -76,14 +78,14 @@ def build_messages(
     return messages
 
 
-def _build_chat_kwargs(user_id: int, prompt: str, image_data: str | None) -> dict:
+def _build_chat_kwargs(user_id: int, prompt: str, image_data: str | None, system: str | None = None) -> dict:
     opts: dict = {"num_predict": MAX_PREDICT_TOKENS}
     temp = get_temperature(user_id)
     if temp is not None:
         opts["temperature"] = temp
     return {
         "model": get_model(user_id),
-        "messages": build_messages(user_id, prompt, image_data),
+        "messages": build_messages(user_id, prompt, image_data, system=system),
         "options": opts,
     }
 
@@ -92,9 +94,10 @@ async def generate(
     user_id: int,
     prompt: str,
     image_data: str | None = None,
+    system: str | None = None,
 ) -> str:
     client = get_client()
-    kwargs = _build_chat_kwargs(user_id, prompt, image_data)
+    kwargs = _build_chat_kwargs(user_id, prompt, image_data, system=system)
 
     # serialize concurrent generations per user.
     sem = _user_semaphores.setdefault(user_id, asyncio.Semaphore(1))

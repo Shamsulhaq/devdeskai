@@ -9,6 +9,8 @@ from collections import defaultdict, deque
 
 from bot import config
 
+from bot.workflow.usage import usage_manager
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
@@ -29,6 +31,7 @@ user_docs: dict[int, str] = {}
 user_personas: dict[int, str] = {}
 # user_ids is internally a set for O(1) membership; serialized as a sorted list.
 stats: dict = {"total_messages": 0, "user_ids": set()}
+workflows: dict[int, "Workflow"] = {}
 
 # module-level lock; asyncio.Lock() does not require a running loop in 3.10+.
 _save_lock: asyncio.Lock = asyncio.Lock()
@@ -74,7 +77,7 @@ def _coerce_user_ids(raw) -> set[int]:
 
 def load(path: str) -> None:
     global chat_histories, user_prompts, user_models, user_temps, user_agent
-    global user_agent_history, user_docs, user_personas, stats
+    global user_agent_history, user_docs, user_personas, stats, workflows
     try:
         with open(path) as f:
             data = json.load(f)
@@ -132,6 +135,19 @@ def load(path: str) -> None:
         "total_messages": int(raw_stats.get("total_messages", 0) or 0),
         "user_ids": _coerce_user_ids(raw_stats.get("user_ids")),
     }
+    try:
+        from bot.workflow.models import Workflow
+        workflows = {
+            int(k): Workflow.from_dict(v)
+            for k, v in data.get("workflows", {}).items()
+        }
+    except Exception:
+        logger.exception("Failed to load workflows; starting fresh")
+        workflows = {}
+    try:
+        usage_manager.from_dict(data.get("agent_usage", {}))
+    except Exception:
+        logger.exception("Failed to load agent usage")
     logger.info("Loaded data from %s (schema v%d)", path, version)
 
 
@@ -156,6 +172,10 @@ def _serialize() -> dict:
             "total_messages": stats.get("total_messages", 0),
             "user_ids": sorted(stats.get("user_ids", set())),
         },
+        "workflows": {
+            str(k): v.to_dict() for k, v in workflows.items()
+        },
+        "agent_usage": usage_manager.to_dict(),
     }
 
 

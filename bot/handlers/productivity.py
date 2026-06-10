@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 from html import escape
 
 from telegram import Update, InputFile
@@ -9,6 +10,8 @@ from telegram.ext import ContextTypes
 from bot import config, persistence
 from bot.ollama import OllamaError, generate, reply_long
 
+logger = logging.getLogger(__name__)
+
 DDGS_AVAILABLE = False
 PYMUPDF_AVAILABLE = False
 
@@ -17,6 +20,24 @@ try:
     DDGS_AVAILABLE = True
 except ImportError:
     pass
+
+# DDG occasionally serves an anti-bot "protection / privacy peace of mind"
+# splash instead of results. Detect that and tell the user to retry rather
+# than dumping the raw exception.
+_DDG_PROTECTION_MARKERS = (
+    "duckduckgo-protection",
+    "privacy, simplified",
+    "peace of mind",
+    "anomaly",
+    "ratelimit",
+    "rate limit",
+    "202 ratelimit",
+)
+
+
+def _looks_like_ddg_protection(err: BaseException) -> bool:
+    msg = str(err).lower()
+    return any(m in msg for m in _DDG_PROTECTION_MARKERS)
 
 try:
     import fitz
@@ -41,18 +62,50 @@ async def web_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
 
+    # DDG frequently serves an anti-bot splash from one backend while
+    # others still work. Try each in order before giving up.
+    def _ddg_search(q: str):
+        last_err: Exception | None = None
+        for backend in ("api", "html", "lite"):
+            try:
+                with DDGS() as ddgs:
+                    return list(
+                        ddgs.text(q, max_results=5, backend=backend)
+                    )
+            except TypeError:
+                # Older/newer DDGS versions don't accept `backend=`; one
+                # attempt without it is the best we can do.
+                try:
+                    with DDGS() as ddgs:
+                        return list(ddgs.text(q, max_results=5))
+                except Exception as e:
+                    last_err = e
+                    break
+            except Exception as e:
+                last_err = e
+                logger.warning("DDG backend %s failed: %s", backend, e)
+                continue
+        if last_err is not None:
+            raise last_err
+        return []
+
     try:
-        # DDGS context manager + .text() is sync; run in a thread.
-        def _ddg_search(q: str):
-            with DDGS() as ddgs:
-                return list(ddgs.text(q, max_results=5))
         results = await asyncio.to_thread(_ddg_search, query)
     except Exception as e:
-        await update.message.reply_text(f"Search error: {e}")
+        logger.warning("DDG search failed for %r: %s", query, e)
+        if _looks_like_ddg_protection(e):
+            await update.message.reply_text(
+                "DuckDuckGo is rate-limiting search right now. "
+                "Please try again in a minute."
+            )
+        else:
+            await update.message.reply_text(f"Search error: {escape(str(e))}")
         return
 
     if not results:
-        await update.message.reply_text("No results found.")
+        await update.message.reply_text(
+            "No results found (DuckDuckGo may be rate-limiting; try again shortly)."
+        )
         return
 
     ctx = f"Search results for query: {query}\n\n"

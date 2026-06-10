@@ -15,12 +15,12 @@ AGENTS_CONFIG: dict[str, dict] = {
     "opencode": {
         "label": "OpenCode",
         "check": "opencode",
-        "run_cmd": "opencode",
+        "run_cmd": "opencode run",
     },
     "codex": {
         "label": "Codex (OpenAI)",
         "check": "codex",
-        "run_cmd": "codex",
+        "run_cmd": "codex exec --skip-git-repo-check",
     },
     "qwen": {
         "label": "Qwen (Alibaba)",
