@@ -2,6 +2,7 @@ import json
 import re
 
 from bot import ollama
+from bot.workflow import tech
 
 PRD_SYSTEM_PROMPT = (
     "You are a product manager creating a detailed Product Requirements Document (PRD). "
@@ -41,6 +42,68 @@ ROUTING_SYSTEM_PROMPT = (
 SUMMARY_SYSTEM_PROMPT = (
     "You are a project manager creating a brief completion summary. "
     "Summarize what was built, the tech used, and key results. Keep it concise."
+)
+
+PRD_WITH_TECH_STACK_PROMPT = (
+    "You are a senior software architect. Create a detailed PRD with an explicit "
+    "Tech Stack section.\n\n"
+    "Required sections (in order):\n"
+    "1. Project Overview\n"
+    "2. Tech Stack — MUST specify:\n"
+    "   - Language and version (e.g., Python 3.11, JavaScript ES2022)\n"
+    "   - Framework and version (e.g., Flask 3.0, React 18, none)\n"
+    "   - Build tool (e.g., npm, pip, cargo, go build)\n"
+    "   - Test framework and exact test command (e.g., 'pytest', 'npm test')\n"
+    "   - Linter/formatter (e.g., 'ruff check .', 'eslint .', none)\n"
+    "3. Features — list every feature with acceptance criteria\n"
+    "4. Architecture — high-level system design\n"
+    "5. Pages / Components\n"
+    "6. Test Plan — which test types, which files\n"
+    "7. Documentation Plan\n\n"
+    "Tech Stack section MUST be specific and concrete. The exact test command "
+    "is required so the brain can run tests without guessing."
+)
+
+CLASSIFY_REQUEST_PROMPT = (
+    "You are classifying a user request into a category. Output ONLY valid JSON:\n"
+    '{"category": "<one of: code_build, code_fix, code_review, '
+    'research, analysis, writing, creative, data, question, general>", '
+    '"confidence": 0.0-1.0}\n\n'
+    "Categories:\n"
+    "- code_build: build/ develop/ create a new project/app/tool\n"
+    "- code_fix: fix bugs, repair broken code\n"
+    "- code_review: review existing code, audit, check for issues\n"
+    "- research: explain concepts, find out about topics\n"
+    "- analysis: compare, evaluate, assess, analyze data\n"
+    "- writing: write articles, blog posts, essays\n"
+    "- creative: poems, stories, jokes, creative content\n"
+    "- data: calculate, compute, process data\n"
+    "- question: simple Q&A, factual lookups\n"
+    "- general: anything else\n\n"
+    "If the request is about creating or building software, code_build is the best fit."
+)
+
+EXTRACT_TECH_STACK_PROMPT = (
+    "Extract the tech stack from this PRD. Output ONLY valid JSON:\n"
+    "{\n"
+    '  "language": "<primary language>",\n'
+    '  "version": "<language version if specified>",\n'
+    '  "framework": "<framework name or empty>",\n'
+    '  "test_cmd": "<exact test command>",\n'
+    '  "lint_cmd": "<linter command or empty>",\n'
+    '  "build_cmd": "<build command or empty>"\n'
+    "}"
+)
+
+TEST_CONFIDENCE_PROMPT = (
+    "Evaluate whether I (Ollama) can confidently run tests for this project. "
+    "Consider:\n"
+    "- Tech stack standard-ness (Python+pytest=high, exotic framework=low)\n"
+    "- Whether tests need external services (DB, network, browser)\n"
+    "- Project size and complexity\n"
+    "- Whether the test command is well-known\n\n"
+    "Output ONLY valid JSON:\n"
+    '{"confident": 0.0-1.0, "reason": "<one-sentence explanation>"}'
 )
 
 
@@ -151,6 +214,240 @@ async def pick_best_agent(
     return chosen
 
 
+async def generate_project_name(request: str, user_id: int) -> str:
+    """Brain generates a filesystem-safe project name from the request.
+
+    e.g., 'personal website for software engineer' → 'personal-website-software-engineer'
+    """
+    import re
+    prompt = (
+        f"Generate a short, kebab-case project name (max 4 words) for: {request}\n"
+        "Output ONLY the name, no explanation. Lowercase, words separated by hyphens."
+    )
+    response = await ollama.generate(user_id, prompt, system="You name projects.")
+    name = response.strip().split("\n")[0].strip().lower()
+    name = re.sub(r"[^a-z0-9-]", "-", name)
+    name = re.sub(r"-+", "-", name).strip("-")
+    if not name:
+        name = "project"
+    return name[:50]
+
+
+async def classify_request(request: str, user_id: int) -> str:
+    """Classify a user request as code_build / code_fix / research / writing / etc.
+
+    Uses keyword matching first (fast), falls back to Ollama classification.
+    """
+    text = request.lower()
+    code_keywords = ["build", "create", "develop", "make", "implement", "code", "app", "website", "project", "script", "tool", "cli", "api", "service"]
+    fix_keywords = ["fix", "bug", "error", "broken", "not working", "issue", "repair"]
+    review_keywords = ["review", "check code", "audit", "analyze code"]
+    research_keywords = ["what is", "explain", "tell me about", "how does", "research"]
+    writing_keywords = ["write", "draft", "blog", "article", "essay", "report"]
+    creative_keywords = ["poem", "story", "joke", "creative", "rhyme"]
+    data_keywords = ["calculate", "compute", "process data", "analyze data", "statistics"]
+
+    if any(k in text for k in fix_keywords) and any(k in text for k in code_keywords + ["code"]):
+        return "code_fix"
+    if any(k in text for k in review_keywords):
+        return "code_review"
+    if any(k in text for k in code_keywords):
+        return "code_build"
+    if any(k in text for k in data_keywords):
+        return "data"
+    if any(k in text for k in writing_keywords):
+        return "writing"
+    if any(k in text for k in creative_keywords):
+        return "creative"
+    if any(k in text for k in research_keywords):
+        return "research"
+
+    try:
+        prompt = f"Classify this request: {request}"
+        response = await ollama.generate(user_id, prompt, system=CLASSIFY_REQUEST_PROMPT)
+        result = _extract_json(response, {"category": "general", "confidence": 0.5})
+        return result.get("category", "general")
+    except Exception:
+        return "general"
+
+
+async def generate_prd_with_tech_stack(
+    request: str, project_name: str, user_id: int
+) -> str:
+    """Generate a PRD with explicit Tech Stack section."""
+    prompt = (
+        f"Project name: {project_name}\n"
+        f"User request: {request}\n\n"
+        "Create the PRD. The Tech Stack section is critical — the brain will use it "
+        "to run tests, so include the exact test command."
+    )
+    return await ollama.generate(user_id, prompt, system=PRD_WITH_TECH_STACK_PROMPT)
+
+
+async def extract_tech_stack(prd: str, user_id: int) -> dict:
+    """Extract tech stack dict from PRD text, validated against known stacks."""
+    try:
+        response = await ollama.generate(
+            user_id,
+            f"PRD:\n{prd[:3000]}",
+            system=EXTRACT_TECH_STACK_PROMPT,
+        )
+        result = _extract_json(response, {})
+        return tech.validate_tech_stack(result)
+    except Exception:
+        return {}
+
+
+async def evaluate_test_confidence(
+    tech_stack: dict, project_dir: str, user_id: int
+) -> float:
+    """Brain evaluates whether it can confidently run tests itself.
+
+    Returns 0-1. Higher = more confident.
+    """
+    if not tech_stack or not tech_stack.get("test_cmd"):
+        return 0.0
+    if tech.has_external_services(tech_stack):
+        return 0.2
+
+    files = tech.list_project_files(project_dir, max_files=15)
+    prompt = (
+        f"Tech stack: {tech_stack}\n"
+        f"Project files ({len(files)}): {', '.join(files[:10])}\n\n"
+        "Can I (Ollama) confidently run the test command myself?"
+    )
+    try:
+        response = await ollama.generate(user_id, prompt, system=TEST_CONFIDENCE_PROMPT)
+        result = _extract_json(response, {"confident": 0.5})
+        return float(result.get("confident", 0.5))
+    except Exception:
+        return 0.5
+
+
+async def brain_run_tests(
+    tech_stack: dict, project_dir: str, user_id: int
+) -> dict:
+    """Brain runs the test command itself and parses results.
+
+    Returns {passed, summary, failures, exit_code, stdout, stderr}.
+    """
+    import asyncio
+    test_cmd = tech_stack.get("test_cmd", "")
+    if not test_cmd:
+        return {"passed": True, "skipped": True, "summary": "No test command"}
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            test_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=project_dir,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return {"passed": False, "summary": "Test command timed out (120s)",
+                    "exit_code": -1, "stdout": "", "stderr": "timeout"}
+
+        out = stdout.decode("utf-8", errors="replace")
+        err = stderr.decode("utf-8", errors="replace")
+        passed = proc.returncode == 0
+        summary = _summarize_test_output(out, err, passed)
+        return {
+            "passed": passed,
+            "summary": summary,
+            "exit_code": proc.returncode,
+            "stdout": out[-2000:],
+            "stderr": err[-2000:],
+        }
+    except Exception as e:
+        return {"passed": False, "summary": f"Test execution error: {e}",
+                "exit_code": -1, "stdout": "", "stderr": str(e)}
+
+
+def _summarize_test_output(stdout: str, stderr: str, passed: bool) -> str:
+    """Pull the most useful lines from test output."""
+    lines = []
+    for line in (stdout + "\n" + stderr).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if any(kw in line.lower() for kw in ["passed", "failed", "error", "test", "expect"]):
+            lines.append(line)
+        if len(lines) >= 20:
+            break
+    if not lines:
+        lines = (stdout + stderr).strip().splitlines()[:5]
+    return "\n".join(lines) or ("Tests passed" if passed else "Tests failed (no details)")
+
+
+async def try_with_model_swap(
+    callable_fn, models: list[str], user_id: int,
+) -> str:
+    """Try callable with each model in order. First success wins.
+
+    callable_fn(model) should accept a model name and return a string result.
+    A result is considered 'good' if it's non-empty and doesn't look like garbage.
+    """
+    from bot import persistence
+    from bot import ollama as ollama_module
+
+    original = persistence.user_models.get(user_id)
+    last_result = ""
+    for model in models:
+        try:
+            persistence.user_models[user_id] = model
+            ollama_module._client = None
+            result = await callable_fn(model)
+            if result and not _is_low_quality(result):
+                persistence.user_models[user_id] = original or model
+                return result
+            last_result = result or last_result
+        except Exception:
+            continue
+    if original:
+        persistence.user_models[user_id] = original
+    return last_result or "All models failed"
+
+
+def _is_low_quality(text: str) -> bool:
+    """Heuristic to detect bad model output worth retrying."""
+    if not text or not text.strip():
+        return True
+    if len(text.strip()) < 20:
+        return True
+    return False
+
+
+def format_test_prompt(tech_stack: dict, project_files: list) -> str:
+    """Build prompt for test agent to create test cases."""
+    files_str = "\n".join(f"  - {f}" for f in project_files[:20])
+    return (
+        f"Tech stack: {tech_stack}\n"
+        f"Test command to use: {tech_stack.get('test_cmd', 'pytest')}\n\n"
+        f"Project files:\n{files_str}\n\n"
+        "Create comprehensive test cases for this project. "
+        "Use the specified test framework. Output test files using the same "
+        "marker format as the code step: '--- filename.ext ---' on its own line."
+    )
+
+
+def format_fix_prompt(test_results: dict, project_files: list) -> str:
+    """Build prompt for fix agent based on test failure."""
+    files_str = "\n".join(f"  - {f}" for f in project_files[:20])
+    return (
+        "Tests failed. Analyze the failures and fix the code.\n\n"
+        f"Test summary:\n{test_results.get('summary', 'unknown')}\n\n"
+        f"Exit code: {test_results.get('exit_code', 'unknown')}\n\n"
+        f"stderr (last 2000 chars):\n{test_results.get('stderr', '')[:2000]}\n\n"
+        f"stdout (last 2000 chars):\n{test_results.get('stdout', '')[:2000]}\n\n"
+        f"Project files:\n{files_str}\n\n"
+        "Output the FIXED files using '--- filename.ext ---' markers. "
+        "Only output files that need changes."
+    )
+
+
 def format_code_prompt(prd: str) -> str:
     return (
         "Build a complete, runnable project based on this PRD. "
@@ -204,29 +501,6 @@ def format_verify_prompt(files: dict[str, str]) -> str:
     )
 
 
-def format_fix_prompt(
-    root_cause: str, approach: str, files: dict[str, str], previous_attempts: list[dict],
-) -> str:
-    files_section = "\n\n".join(
-        f"--- {path} ---\n{content[:3000]}" for path, content in files.items()
-    )
-    attempts = ""
-    if previous_attempts:
-        attempts = "\n\nPrevious attempts:\n" + "\n".join(
-            f"  Attempt {a['cycle']}: {a.get('approach', 'fix')[:200]}"
-            for a in previous_attempts[-3:]
-        )
-    return (
-        f"Root cause: {root_cause}\n"
-        f"Approach: {approach}{attempts}\n\n"
-        f"Current files:\n{files_section[:5000]}\n\n"
-        "Output the FIXED files using the same marker format:\n"
-        "--- filename.ext ---\n"
-        "fixed content\n\n"
-        "Output ALL files that need changes, each with its marker."
-    )
-
-
 def format_doc_prompt(file_list: list[str], files: dict[str, str]) -> str:
     files_str = "\n".join(f"  - {f}" for f in file_list)
     code_section = "\n\n".join(
@@ -239,6 +513,33 @@ def format_doc_prompt(file_list: list[str], files: dict[str, str]) -> str:
         f"Key code:\n{code_section}\n\n"
         "Include: project description, setup, usage, structure."
     )
+
+
+async def execute_brain_step(step, user_id: int) -> str:
+    """Execute a brain-sourced step (uses Ollama directly)."""
+    from bot import ollama as ollama_module
+    return await ollama_module.generate(user_id, step.prompt)
+
+
+EVALUATE_STEP_SYSTEM_PROMPT = (
+    "You are a QA reviewer evaluating task output against success criteria. "
+    "Output ONLY valid JSON:\n"
+    '{"verdict": "pass", "explanation": "<why it passes>"}\n'
+    '{"verdict": "fail", "issues": "<what needs fixing>"}'
+)
+
+
+async def evaluate_step(step_id: str, output: str, criteria: str, user_id: int) -> dict:
+    """Generic step evaluation gate. Returns dict with verdict and issues."""
+    from bot import ollama as ollama_module
+    prompt = (
+        f"Step: {step_id}\n"
+        f"Success criteria: {criteria}\n\n"
+        f"Output to evaluate:\n{output[:4000]}\n\n"
+        "Does the output meet the criteria? Output JSON only."
+    )
+    response = await ollama_module.generate(user_id, prompt, system=EVALUATE_STEP_SYSTEM_PROMPT)
+    return _extract_json(response, {"verdict": "fail", "issues": "Could not parse evaluation"})
 
 
 def parse_file_markers(text: str) -> dict[str, str]:

@@ -2,9 +2,7 @@ import asyncio
 import base64
 import io
 import logging
-import os
 import tempfile
-import time
 from html import escape
 from pathlib import Path
 
@@ -133,7 +131,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
     try:
         await generate_and_reply(update, uid, user_text, image_data)
-    except Exception as e:
+    except Exception:
         # log full exception, send generic reply
         logger.exception("chat handler failed")
         await update.message.reply_text("Error. Is Ollama running?")
@@ -192,7 +190,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         persistence.track_user(uid)
         await persistence.save_async(config.DATA_FILE)
         await reply_long(update, escape(reply))
-    except Exception as e:
+    except Exception:
         # log full exception, send generic reply
         logger.exception("voice handler failed")
         await update.message.reply_text(
@@ -276,10 +274,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await persistence.save_async(config.DATA_FILE)
         msg = f"Document saved ({len(text)} chars"
         if truncated:
-            msg += f", truncated from original"
+            msg += ", truncated from original"
         msg += "). Use /ask <question> to query it."
         await update.message.reply_text(msg)
-    except Exception as e:
+    except Exception:
         # log full exception, send generic reply
         logger.exception("doc handler failed")
         await update.message.reply_text(
@@ -303,7 +301,7 @@ async def handle_group_mention(
     )
     try:
         await generate_and_reply(update, uid, cleaned)
-    except Exception as e:
+    except Exception:
         # log full exception, send generic reply
         logger.exception("group mention handler failed")
         await update.message.reply_text("Error.")

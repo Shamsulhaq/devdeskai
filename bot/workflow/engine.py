@@ -3,20 +3,10 @@ import time
 from typing import Callable, Coroutine
 
 from bot import config, persistence
-from bot.workflow.models import Workflow, StageType, Artifact
-from bot.workflow import brain, orchestrator
+from bot.workflow.models import Workflow, StageType, Step
+from bot.workflow import planner, brain as brain_module, orchestrator
 
 Notify = Callable[[str, list[dict]], Coroutine]
-
-TODO_PLAN = [
-    {"id": "prd",   "label": "Brain creates PRD"},
-    {"id": "code",  "label": "opencode builds project files"},
-    {"id": "tests", "label": "codex writes test cases"},
-    {"id": "verify","label": "claude verifies code + tests"},
-    {"id": "fix",   "label": "Fix issues (if needed)"},
-    {"id": "docs",  "label": "claude creates documentation"},
-    {"id": "done",  "label": "Build complete"},
-]
 
 
 async def create_workflow(user_id: int, task: str) -> Workflow:
@@ -33,229 +23,126 @@ async def create_workflow(user_id: int, task: str) -> Workflow:
 
 
 async def run_brain_build(wf: Workflow, notify: Notify | None = None) -> dict:
-    """Brain-driven autonomous build with live todo progress updates."""
+    """Generic DAG executor: plan → execute steps → review → complete.
+
+    Steps run respecting dependency order. Independent steps execute in
+    parallel. Steps with retry policies go through a review gate.
+    """
     workspace = wf.workspace_dir
     os.makedirs(workspace, exist_ok=True)
 
-    todo = [dict(t, status="pending") for t in TODO_PLAN]
-    if notify:
-        await notify("🧠 **Brain engaged!** Starting build...", todo)
-
-    steps_log = []
-    max_fix = 5
-    fix_attempts: list[dict] = []
-
-    # ── Step 1: Brain generates PRD ──
-    # PRD saved to brain_dir (brain-only root) AND workspace (agent project folder)
-    todo[0]["status"] = "in_progress"
-    if notify:
-        await notify(f"**Step 1/7:** {todo[0]['label']}", todo)
-
-    prd = await brain.generate_prd(wf.task, wf.user_id)
-    brain_dir = Workflow.brain_dir(wf.user_id)
-    _write_file(brain_dir, f"{wf.id}-PRD.md", prd)   # brain root access
-    _write_file(workspace, "PRD.md", prd)              # agent project access
-    wf.artifacts.append(Artifact(name="PRD.md", agent="brain", content=prd[:200], stage="prd"))
-    wf.action_history.append({"action": "generate_prd", "result": "PRD created"})
-    wf.current_stage = StageType.CODING
+    available = {
+        name: info.get("available", False)
+        for name, info in orchestrator._get_available_agents().items()
+    }
+    work_plan = await planner.decompose_task(wf.task, wf.user_id, available)
+    wf.plan = work_plan
+    wf.current_stage = StageType.PLANNING
     wf.updated_at = time.time()
     await persistence.save_async(config.DATA_FILE)
-    steps_log.append("1. ✅ Brain created the PRD")
-    todo[0]["status"] = "completed"
 
-    # ── Step 2: Parallel dispatch (opencode → code, codex → tests) ──
-    todo[1]["status"] = "in_progress"
-    todo[2]["status"] = "in_progress"
+    steps = work_plan.steps
+    step_map: dict[str, Step] = {s.id: s for s in steps}
+
     if notify:
-        await notify("**Step 2/7:** Building project + writing tests in parallel...", todo)
+        await notify(
+            f"🧠 **Plan ready!** {len(steps)} steps\n_{work_plan.summary}_",
+            _todo_list(steps),
+        )
 
-    code_prompt = brain.format_code_prompt(prd)
-    tests_prompt = brain.format_tests_prompt(prd)
+    steps_log = []
+    all_files = set()
+    max_parallel = 3
 
-    code_result, tests_result = await orchestrator.run_parallel(
-        [{"agent": "opencode", "prompt": code_prompt},
-         {"agent": "codex", "prompt": tests_prompt}],
-        workspace, wf.user_id,
-    )
+    while True:
+        ready = _ready_steps(steps, step_map)
+        if not ready:
+            remaining = [s for s in steps if s.status == "pending"]
+            if not remaining:
+                break
+            waiting = [s.id for s in remaining]
+            steps_log.append(f"⏳ Deadlock or waiting on: {', '.join(waiting)}")
+            break
 
-    if isinstance(code_result, Exception):
-        todo[1]["status"] = "failed"
+        batch = ready[:max_parallel]
+        for s in batch:
+            s.status = "running"
         if notify:
-            await notify(f"❌ **Error:** opencode failed — {code_result}", todo)
-        return {"error": f"opencode failed: {code_result}", "steps": steps_log}
-    if isinstance(tests_result, Exception):
-        todo[2]["status"] = "failed"
+            await notify("**Executing steps...**", _todo_list(steps))
+
+        results = await _execute_batch(batch, wf, workspace)
+
+        for step, result in zip(batch, results):
+            if isinstance(result, Exception):
+                step.status = "failed"
+                steps_log.append(f"❌ {step.label} failed: {result}")
+                if notify:
+                    await notify(f"❌ **{step.label}** failed", _todo_list(steps))
+                continue
+
+            if step.retry and step.retry.max_retries > 0:
+                passed, issues = await _review_step(wf, step, result)
+                if passed:
+                    step.status = "completed"
+                    steps_log.append(f"✅ {step.label} passed review")
+                else:
+                    fixed = await _rework_step(wf, step, result, issues, workspace)
+                    if fixed:
+                        step.status = "completed"
+                        steps_log.append(f"✅ {step.label} fixed after rework")
+                    else:
+                        step.status = "failed"
+                        steps_log.append(f"❌ {step.label} failed review")
+            else:
+                step.status = "completed"
+                steps_log.append(f"✅ {step.label}")
+
+            if step.status == "completed" and step.agent != "brain":
+                step_files = brain_module.parse_file_markers(step.output)
+                for name, content in step_files.items():
+                    _write_file(workspace, name, content)
+                    all_files.add(name)
+
+            wf.action_history.append({
+                "action": step.id,
+                "result": f"{step.label}: {step.status}",
+            })
+            wf.updated_at = time.time()
+            await persistence.save_async(config.DATA_FILE)
+
         if notify:
-            await notify(f"❌ **Error:** codex failed — {tests_result}", todo)
-        return {"error": f"codex failed: {tests_result}", "steps": steps_log}
+            await notify(
+                f"**Progress:** {sum(1 for s in steps if s.status == 'completed')}/{len(steps)} steps",
+                _todo_list(steps),
+            )
 
-    code_files = brain.parse_file_markers(code_result)
-    test_files = brain.parse_file_markers(tests_result)
-    for name, content in code_files.items():
-        _write_file(workspace, name, content)
-    for name, content in test_files.items():
-        _write_file(workspace, name, content)
-
-    wf.action_history.append({"action": "dispatch_code", "result": f"opencode: {len(code_files)} files"})
-    wf.action_history.append({"action": "dispatch_tests", "result": f"codex: {len(test_files)} files"})
-    await persistence.save_async(config.DATA_FILE)
-
-    code_count = len([n for n in _list_workspace_files(workspace) if n != "PRD.md" and not n.startswith(".")])
-    steps_log.append(f"2. ✅ opencode built project | codex wrote tests")
-    todo[1]["status"] = "completed"
-    todo[2]["status"] = "completed"
-    if notify:
-        await notify(f"**Step 2/7 Complete:** {code_count} files in workspace", todo)
-
-    # ── Step 3–4: Fix-verify loop ──
-    for cycle in range(max_fix):
-        wf.current_stage = StageType.VERIFY
+    failed = [s for s in steps if s.status == "failed"]
+    if failed:
+        wf.current_stage = StageType.CANCELLED
+        wf.status = "cancelled"
         wf.updated_at = time.time()
         await persistence.save_async(config.DATA_FILE)
+        return {
+            "error": f"Failed steps: {', '.join(s.id for s in failed)}",
+            "steps": steps_log,
+            "files": sorted(all_files),
+        }
 
-        file_contents = _read_project_files(workspace)
-        if not file_contents:
-            steps_log.append("3. ⚠️  No project files found")
-            break
-
-        todo[3]["status"] = "in_progress"
-        todo[3]["label"] = f"claude verifies (cycle {cycle + 1})"
-        if notify:
-            await notify(f"**Step 3/7:** {todo[3]['label']}", todo)
-
-        verify_prompt = brain.format_verify_prompt(file_contents)
-        verify_result = await orchestrator.run_brain_step(
-            "claude", verify_prompt, workspace, wf.user_id
-        )
-
-        wf.action_history.append({"action": "verify", "result": verify_result[:300]})
-        wf.artifacts.append(Artifact(
-            name=f"verify_report_{cycle}.txt", agent="claude",
-            content=verify_result[:200], stage="verify"
-        ))
-        await persistence.save_async(config.DATA_FILE)
-
-        evaluation = await brain.evaluate_verification(verify_result, wf.user_id)
-
-        if evaluation.get("verdict") == "pass":
-            steps_log.append(f"3. ✅ claude verified — all good (cycle {cycle + 1})")
-            wf.fix_count = cycle
-            todo[3]["status"] = "completed"
-            if notify:
-                await notify("✅ **Verification passed!** Moving to documentation...", todo)
-            break
-
-        issues = evaluation.get("issues", "Verification failed")
-        steps_log.append(f"3. ⚠️  Issues found (cycle {cycle + 1}/{max_fix})")
-
-        todo[3]["status"] = "failed"
-        if notify:
-            await notify(f"⚠️ **Verification failed** (cycle {cycle + 1}/{max_fix})", todo)
-
-        # Root cause analysis
-        todo[4]["status"] = "in_progress"
-        todo[4]["label"] = f"Brain analyzing root cause (cycle {cycle + 1})"
-        if notify:
-            await notify(f"**Step 4/7:** {todo[4]['label']}", todo)
-
-        analysis = await brain.analyze_root_cause(
-            verify_result, file_contents, fix_attempts, wf.user_id
-        )
-        root_cause = analysis.get("root_cause", issues)
-        approach = analysis.get("approach", "Fix the issues")
-
-        fix_attempts.append({
-            "cycle": cycle + 1, "issues": issues,
-            "root_cause": root_cause, "approach": approach,
-        })
-
-        keep_going = await brain.should_retry(cycle, max_fix, fix_attempts, wf.user_id)
-        if not keep_going:
-            steps_log.append("4. ⚠️  Brain decided to stop")
-            todo[4]["status"] = "failed"
-            if notify:
-                await notify("⚠️ **Brain decided to stop fixing.** Moving to documentation...", todo)
-            break
-
-        if cycle == max_fix - 1:
-            steps_log.append(f"4. ⚠️  Max fix attempts ({max_fix}) reached")
-            if notify:
-                await notify(f"⚠️ **Max {max_fix} fix attempts reached.** Moving on...", todo)
-            break
-
-        # Apply fix
-        todo[4]["label"] = f"opencode applying fix (cycle {cycle + 1})"
-        if notify:
-            await notify(f"**Step 4/7:** 🔧 {todo[4]['label']}", todo)
-
-        fix_prompt = brain.format_fix_prompt(
-            root_cause, approach, file_contents, fix_attempts
-        )
-        fix_result = await orchestrator.run_brain_step(
-            "opencode", fix_prompt, workspace, wf.user_id
-        )
-
-        fixed_files = brain.parse_file_markers(fix_result)
-        for name, content in fixed_files.items():
-            _write_file(workspace, name, content)
-
-        wf.action_history.append({
-            "action": "fix",
-            "result": f"fix cycle {cycle + 1}: {len(fixed_files)} files",
-        })
-        wf.fix_count = cycle + 1
-        await persistence.save_async(config.DATA_FILE)
-        steps_log.append(f"4. ✅ Fix applied — {len(fixed_files)} files (cycle {cycle + 1})")
-
-        todo[3]["status"] = "pending"  # re-verify
-        todo[4]["status"] = "completed"
-
-    # ── Step 5: Documentation ──
-    todo[5]["status"] = "in_progress"
-    if notify:
-        await notify(f"**Step 5/7:** {todo[5]['label']}", todo)
-
-    project_files = _list_workspace_files(workspace)
-    file_contents = _read_project_files(workspace)
-    doc_prompt = brain.format_doc_prompt(project_files, file_contents)
-    doc_result = await orchestrator.run_brain_step(
-        "claude", doc_prompt, workspace, wf.user_id
-    )
-
-    doc_files = brain.parse_file_markers(doc_result)
-    for name, content in doc_files.items():
-        _write_file(workspace, name, content)
-
-    wf.action_history.append({"action": "document", "result": "README created"})
-    wf.artifacts.append(Artifact(name="README.md", agent="claude", content="documentation generated", stage="docs"))
-    steps_log.append("5. 📝 claude created documentation")
-    todo[5]["status"] = "completed"
-
-    # ── Complete ──
-    project_files = _list_workspace_files(workspace)
-    wf.summary = await brain.generate_summary(wf, wf.user_id)
+    wf.summary = await brain_module.generate_summary(wf, wf.user_id)
     wf.current_stage = StageType.COMPLETED
     wf.status = "completed"
     wf.updated_at = time.time()
     await persistence.save_async(config.DATA_FILE)
-    steps_log.append("6. ✅ Build complete!")
 
-    for item in todo:
-        if item["status"] in ("pending", "in_progress"):
-            item["status"] = "completed"
-    todo[6]["status"] = "completed"
     if notify:
-        files_block = "\n".join(f"• {f}" for f in project_files[:15])
         await notify(
-            f"🎉 **Build Complete!**\n\n"
-            f"📁 `{workspace}`\n"
-            f"{files_block}",
-            todo,
+            f"🎉 **Build Complete!**\n\n{wf.summary[:500]}\n\n📁 {workspace}",
+            _todo_list(steps),
         )
 
     return {
         "steps": steps_log,
-        "files": project_files,
+        "files": sorted(all_files),
         "summary": wf.summary,
     }
 
@@ -266,39 +153,124 @@ def cancel_workflow(wf: Workflow) -> None:
     wf.updated_at = time.time()
 
 
+def _todo_list(steps: list[Step]) -> list[dict]:
+    return [
+        {"id": s.id, "label": s.label, "status": s.status}
+        for s in steps
+    ]
+
+
+def _ready_steps(steps: list[Step], step_map: dict[str, Step]) -> list[Step]:
+    """Return steps whose dependencies are all completed."""
+    ready = []
+    for s in steps:
+        if s.status != "pending":
+            continue
+        if all(step_map.get(dep, Step("", "", "", "")).status == "completed"
+               for dep in s.depends_on):
+            ready.append(s)
+    return ready
+
+
+async def _execute_batch(batch: list[Step], wf: Workflow, workspace: str) -> list:
+    """Execute a batch of steps in parallel via orchestrator."""
+    from bot.workflow import orchestrator as orch
+    tasks = []
+    for step in batch:
+        if step.agent == "brain":
+            tasks.append(brain_module.execute_brain_step(step, wf.user_id))
+        else:
+            tasks.append(orch.run_brain_step(
+                step.agent, step.prompt, workspace, wf.user_id
+            ))
+    return await asyncio_gather_safe(tasks)
+
+
+async def asyncio_gather_safe(tasks: list) -> list:
+    """Gather with return_exceptions, importing asyncio locally."""
+    import asyncio
+    return await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _review_step(wf: Workflow, step: Step, output: str) -> tuple[bool, str]:
+    """Review step output via brain. Returns (passed, issues)."""
+    criteria = step.success_criteria or "Verify correctness, completeness, and quality"
+    evaluation = await brain_module.evaluate_step(
+        step_id=step.id,
+        output=output,
+        criteria=criteria,
+        user_id=wf.user_id,
+    )
+    if evaluation.get("verdict") == "pass":
+        return True, ""
+    return False, evaluation.get("issues", "Verification failed")
+
+
+async def _rework_step(
+    wf: Workflow, step: Step, output: str, issues: str, workspace: str,
+) -> bool:
+    """Retry a step up to its max_retries, with brain-driven root cause analysis."""
+    max_retries = step.retry.max_retries if step.retry else 2
+    attempt = 0
+    fix_attempts: list[dict] = []
+    current_output = output
+
+    while attempt < max_retries:
+        attempt += 1
+        analysis = await brain_module.analyze_root_cause(
+            verify_report=issues,
+            files={},
+            previous_attempts=fix_attempts,
+            user_id=wf.user_id,
+        )
+        fix_attempts.append({
+            "cycle": attempt,
+            "issues": issues,
+            "root_cause": analysis.get("root_cause", issues),
+            "approach": analysis.get("approach", "Fix the issues"),
+        })
+        fix_prompt = (
+            f"Previous attempt had these issues:\n{issues}\n\n"
+            f"Root cause: {analysis.get('root_cause', 'Unknown')}\n"
+            f"Approach: {analysis.get('approach', 'Fix the issues')}\n\n"
+            f"Original task:\n{step.prompt}\n\n"
+            f"Previous output:\n{current_output[:3000]}\n\n"
+            "Output the corrected version."
+        )
+        result = await orchestrator.run_brain_step(
+            step.agent, fix_prompt, workspace, wf.user_id
+        )
+        if isinstance(result, Exception):
+            continue
+
+        evaluation = await brain_module.evaluate_step(
+            step_id=step.id,
+            output=result,
+            criteria=step.success_criteria or "Verify the fix is correct",
+            user_id=wf.user_id,
+        )
+        if evaluation.get("verdict") == "pass":
+            step.output = result
+            wf.fix_count += 1
+            wf.action_history.append({
+                "action": f"rework_{step.id}",
+                "result": f"Fixed after {attempt} rework(s)",
+            })
+            return True
+
+        issues = evaluation.get("issues", "Still failing")
+        current_output = result
+
+    wf.action_history.append({
+        "action": f"rework_{step.id}",
+        "result": f"Failed after {attempt} rework(s)",
+    })
+    return False
+
+
 def _write_file(workspace: str, name: str, content: str) -> str:
     path = os.path.join(workspace, name)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         f.write(content)
     return path
-
-
-def _read_project_files(workspace: str) -> dict[str, str]:
-    files = {}
-    for root, _dirs, names in os.walk(workspace):
-        for name in names:
-            if name.startswith(".") or name == "PRD.md":
-                continue
-            path = os.path.join(root, name)
-            try:
-                with open(path) as f:
-                    content = f.read()
-                rel = os.path.relpath(path, workspace)
-                files[rel] = content
-            except Exception:
-                pass
-    return files
-
-
-def _list_workspace_files(workspace: str) -> list[str]:
-    if not os.path.isdir(workspace):
-        return []
-    files = []
-    for root, _dirs, names in os.walk(workspace):
-        for name in names:
-            if name.startswith("."):
-                continue
-            rel = os.path.relpath(os.path.join(root, name), workspace)
-            files.append(rel)
-    return sorted(files)

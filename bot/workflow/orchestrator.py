@@ -36,6 +36,11 @@ async def _try_agent(
         return Exception(f"{agent} raised: {e}")
 
 
+def _get_available_agents() -> dict[str, dict]:
+    """Expose agent registry with availability for planner/engine."""
+    return agents.get_available()
+
+
 async def run_brain_step(agent: str, prompt: str, workspace: str, user_id: int) -> str:
     """Try preferred agent first; if limited, brain picks next available."""
     from bot.workflow import brain as brain_module

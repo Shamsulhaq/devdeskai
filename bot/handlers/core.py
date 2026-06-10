@@ -7,7 +7,7 @@ from telegram.ext import ContextTypes
 
 from bot import config, persistence
 from bot.agents import get_available
-from bot.ollama import PERSONAS, reply_long
+from bot.ollama import PERSONAS
 
 # and repeated round-trips on /models.
 _model_list_cache: tuple[float, list[str]] | None = None

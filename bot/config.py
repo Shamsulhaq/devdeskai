@@ -29,6 +29,15 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8443"))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
+# Brain fallback models for try_with_model_swap. Comma-separated.
+# When the current model produces low-quality output, the brain cycles
+# through these before giving up.
+FALLBACK_MODELS = os.getenv("FALLBACK_MODELS", "")
+
+# Confidence threshold (0-1) above which the brain runs tests itself
+# rather than delegating to a test agent.
+TEST_CONFIDENCE_THRESHOLD = float(os.getenv("TEST_CONFIDENCE_THRESHOLD", "0.7"))
+
 # validate webhook config
 if WEBHOOK_URL:
     if not WEBHOOK_URL.startswith("https://"):
